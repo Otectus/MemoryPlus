@@ -1,0 +1,2 @@
+graphiti-core>=0.1.0
+nest_asyncio
