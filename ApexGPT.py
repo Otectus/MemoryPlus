@@ -5,7 +5,7 @@ import traceback
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.resolve()
-NYX_CORE_ROOT = PROJECT_ROOT / ".nova"
+NYX_CORE_ROOT = PROJECT_ROOT / "apex"
 PLUGINS_DIR = NYX_CORE_ROOT / "plugins"
 
 def load_single_plugin(plugin_name: str):
