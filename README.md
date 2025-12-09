@@ -7,7 +7,9 @@ Supercharge your local AI with temporal memory! **MemoryPlus** is a plugin for `
 
 > *A quick look at MemoryPlus in action within ApexGPT.*
 > 
-> ![image](https://github.com/Otectus/apex_client/assets/1944352/0f3c5553-6bb1-4475-ae9e-e67c9d961e5f)
+<img width="1863" height="638" alt="Screenshot_20251209_013749" src="https://github.com/user-attachments/assets/edbc0a90-927d-4abe-9f85-eaf9bb731d53" />
+<img width="1667" height="799" alt="Screenshot_20251209_013703" src="https://github.com/user-attachments/assets/beaaa6f3-79d0-454c-bd0a-a2453db6382e" />
+<img width="1667" height="799" alt="Screenshot_20251209_013723" src="https://github.com/user-attachments/assets/e910873b-9a07-4277-a6bc-d96e983205fe" />
 
 
 ## ✨ What is This?
