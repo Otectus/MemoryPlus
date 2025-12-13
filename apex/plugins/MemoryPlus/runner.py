@@ -70,27 +70,35 @@ def sanitize_memory(raw_text: str, config: Dict[str, Any]) -> str:
     """
     if not isinstance(raw_text, str):
         return ""
-    
+
     text = raw_text
     sanitization_config = config.get("sanitization", {})
 
     if sanitization_config.get("sanitize_tool_calls", True):
         text = re.sub(r'<tool_code>.*?</tool_code>', '', text, flags=re.DOTALL)
         text = re.sub(r'<tool_call>.*?</tool_call>', '', text, flags=re.DOTALL)
-    
+
     if sanitization_config.get("sanitize_code_blocks", True):
-        text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
-    
-    # Handle preserve_tagged_code
-    if sanitization_config.get("preserve_tagged_code", True):
-        # Placeholder for future logic
-        pass
-    
+        preserve_tagged_code = sanitization_config.get("preserve_tagged_code", True)
+
+        def _code_replacer(match: re.Match) -> str:
+            leading_newline, prefix, has_keep_tag, block = match.group(1), match.group(2), match.group(3), match.group(4)
+            if preserve_tagged_code and has_keep_tag:
+                return f"{leading_newline}{prefix}{block}"  # Strip the [KEEP_CODE] tag but keep the code block
+            return leading_newline  # Keep surrounding whitespace to avoid collapsing content
+
+        code_pattern = re.compile(r'(^|\n)(\s*)(\[KEEP_CODE\]\s*)?(```.*?```)', re.DOTALL)
+        text = re.sub(code_pattern, _code_replacer, text)
+
+    normalize_whitespace = sanitization_config.get("normalize_whitespace", False)
+    if normalize_whitespace:
+        text = re.sub(r"\n{3,}", "\n\n", text)
+
     # Truncate to max length
     max_len = sanitization_config.get("max_memory_length", 4096)
     if len(text) > max_len:
         text = text[:max_len]
-    
+
     # Custom rules
     custom_rules = sanitization_config.get("custom_sanitization_rules", "")
     if custom_rules:
@@ -99,7 +107,7 @@ def sanitize_memory(raw_text: str, config: Dict[str, Any]) -> str:
                 text = re.sub(rule, "", text)
             except Exception:
                 pass  # Silently ignore malformed regex
-    
+
     return text.strip()
 
 def detect_emotion(text: str, sensitivity: str = "Medium") -> str:
