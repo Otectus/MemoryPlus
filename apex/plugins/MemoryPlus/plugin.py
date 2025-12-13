@@ -457,6 +457,14 @@ class Plugin(BasePlugin):
             self.ingest_stop_event.set()
         if self.ingest_thread and self.ingest_thread.is_alive():
             self.ingest_thread.join(timeout=2)
+        if self.ingest_queue:
+            try:
+                while True:
+                    dropped = self.ingest_queue.get_nowait()
+                    self.log(f"[WARN] Ingest worker stopped. Dropping pending item: {dropped[0]}")
+                    self.ingest_queue.task_done()
+            except queue.Empty:
+                pass
         self.ingest_thread = None
         self.ingest_queue = None
         self.ingest_stop_event = None
