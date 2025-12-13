@@ -4,8 +4,9 @@ import sys
 import os
 import argparse
 import re
-from datetime import datetime
-from typing import Optional, Dict, Any, List
+from datetime import datetime, timedelta
+from hashlib import sha256
+from typing import Optional, Dict, Any, List, Callable
 
 # --- IMPORTS ---
 try:
@@ -109,6 +110,97 @@ def sanitize_memory(raw_text: str, config: Dict[str, Any]) -> str:
                 pass  # Silently ignore malformed regex
 
     return text.strip()
+
+
+def _load_json_list(path: str) -> List[Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return []
+
+
+def _save_json_list(path: str, payload: List[Any]) -> None:
+    try:
+        directory = os.path.dirname(path) or "."
+        os.makedirs(directory, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+    except Exception:
+        pass
+
+
+def _within_window(timestamp: datetime, now: datetime, minutes: int) -> bool:
+    return (now - timestamp) <= timedelta(minutes=minutes)
+
+
+def evaluate_ingestion_controls(
+    content: str,
+    config: Dict[str, Any],
+    now: Optional[datetime] = None,
+    loader: Callable[[str], List[Any]] = _load_json_list,
+    saver: Callable[[str, List[Any]], None] = _save_json_list,
+) -> Optional[str]:
+    """
+    Checks ingestion guardrails. Returns a human-readable reason when ingestion
+    should be skipped; otherwise returns None.
+    """
+
+    settings = config.get("ingestion_controls", {})
+    now = now or datetime.utcnow()
+
+    # Minimum size checks
+    min_chars = settings.get("min_chars")
+    if isinstance(min_chars, int) and len(content.strip()) < min_chars:
+        return "Content shorter than configured min_chars"
+
+    min_words = settings.get("min_words")
+    if isinstance(min_words, int) and len(re.findall(r"\S+", content)) < min_words:
+        return "Content shorter than configured min_words"
+
+    max_tokens = settings.get("max_tokens")
+    if isinstance(max_tokens, int) and len(re.findall(r"\S+", content)) > max_tokens:
+        return "Content exceeds configured max_tokens"
+
+    # Rate limiting
+    max_ingestions = settings.get("max_ingestions_per_minute")
+    if isinstance(max_ingestions, int) and max_ingestions > 0:
+        cache_path = settings.get("rate_limit_cache", "/tmp/memoryplus_ingest_rate.json")
+        timestamps = []
+        for ts in loader(cache_path):
+            try:
+                parsed = datetime.fromisoformat(ts)
+                if _within_window(parsed, now, 1):
+                    timestamps.append(parsed)
+            except Exception:
+                continue
+        if len(timestamps) >= max_ingestions:
+            return "Ingestion rate limit exceeded"
+        timestamps.append(now)
+        saver(cache_path, [t.isoformat() for t in timestamps])
+
+    # Deduplication window
+    dedup_minutes = settings.get("deduplication_window_minutes")
+    if isinstance(dedup_minutes, int) and dedup_minutes > 0:
+        cache_path = settings.get("dedup_cache", "/tmp/memoryplus_dedup.json")
+        digest = sha256(content.strip().encode("utf-8")).hexdigest()
+        entries = []
+        seen_recently = False
+        for entry in loader(cache_path):
+            try:
+                entry_time = datetime.fromisoformat(entry.get("timestamp", ""))
+                if _within_window(entry_time, now, dedup_minutes):
+                    entries.append(entry)
+                    if entry.get("digest") == digest:
+                        seen_recently = True
+            except Exception:
+                continue
+        if seen_recently:
+            return "Duplicate content within deduplication window"
+        entries.append({"digest": digest, "timestamp": now.isoformat()})
+        saver(cache_path, entries)
+
+    return None
 
 def detect_emotion(text: str, sensitivity: str = "Medium") -> str:
     # Placeholder logic for emotion detection
@@ -276,21 +368,27 @@ async def execute_operation(client: Graphiti, args: argparse.Namespace, config: 
             print(json.dumps({"status": "skipped", "message": "Content was empty after sanitization."}))
             return
 
-        # 3. Insight Generation (on original content for full context)
+        # 3. Ingestion guardrails
+        ingestion_reason = evaluate_ingestion_controls(sanitized_content, config)
+        if ingestion_reason:
+            print(json.dumps({"status": "skipped", "message": ingestion_reason}))
+            return
+
+        # 4. Insight Generation (on original content for full context)
         insight = generate_insight(config, original_content, args.mode)
-        
-        # 4. Assemble Content
+
+        # 5. Assemble Content
         # Start with the cleaned conversation
         final_content = sanitized_content
-        
+
         # Prepend insight if it exists
         if insight:
             final_content = f"[MEMORY_MODE: {args.mode}]\n[INSIGHT_START]\n{insight}\n[INSIGHT_END]\n\n{final_content}"
 
-        # 5. Intelligence Layer (e.g., tagging)
+        # 6. Intelligence Layer (e.g., tagging)
         final_content = apply_intelligence_layer(final_content, original_content, config)
 
-        # 6. Custom Memory Tags
+        # 7. Custom Memory Tags
         advanced = config.get("advanced", {})
         custom_tags = advanced.get("custom_memory_tags", "")
         if custom_tags:
@@ -298,7 +396,7 @@ async def execute_operation(client: Graphiti, args: argparse.Namespace, config: 
             tag_prefix = "".join([f"[TAG: {t}]" for t in tag_list])
             final_content = f"{tag_prefix} {final_content}"
 
-        # 7. Add to Database
+        # 8. Add to Database
         await client.add_episode(
             name=args.name,
             episode_body=final_content,

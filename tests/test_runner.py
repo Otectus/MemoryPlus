@@ -3,6 +3,8 @@ import pathlib
 import sys
 import types
 import unittest
+from datetime import datetime, timedelta
+import tempfile
 
 
 RUNNER_PATH = pathlib.Path(__file__).resolve().parents[1] / "apex" / "plugins" / "MemoryPlus" / "runner.py"
@@ -48,6 +50,7 @@ assert spec.loader is not None
 spec.loader.exec_module(runner_module)
 
 sanitize_memory = runner_module.sanitize_memory
+evaluate_ingestion_controls = runner_module.evaluate_ingestion_controls
 
 
 class SanitizeMemoryTests(unittest.TestCase):
@@ -96,6 +99,39 @@ class SanitizeMemoryTests(unittest.TestCase):
         result = sanitize_memory(raw, config)
 
         self.assertEqual(result, "first\n\n\nsecond")
+
+
+class IngestionControlTests(unittest.TestCase):
+    def test_respects_minimum_words(self):
+        config = {"ingestion_controls": {"min_words": 4}}
+
+        reason = evaluate_ingestion_controls("too short", config)
+
+        self.assertEqual(reason, "Content shorter than configured min_words")
+
+    def test_rate_limit_blocks_after_threshold(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = str(pathlib.Path(tmpdir) / "rate.json")
+            config = {"ingestion_controls": {"max_ingestions_per_minute": 1, "rate_limit_cache": cache_path}}
+            now = datetime(2024, 1, 1, 12, 0, 0)
+
+            first = evaluate_ingestion_controls("allowed first", config, now=now)
+            second = evaluate_ingestion_controls("blocked second", config, now=now + timedelta(seconds=10))
+
+            self.assertIsNone(first)
+            self.assertEqual(second, "Ingestion rate limit exceeded")
+
+    def test_deduplication_skips_recent_duplicate(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = str(pathlib.Path(tmpdir) / "dedup.json")
+            config = {"ingestion_controls": {"deduplication_window_minutes": 10, "dedup_cache": cache_path}}
+            now = datetime(2024, 1, 1, 12, 0, 0)
+
+            first = evaluate_ingestion_controls("same content", config, now=now)
+            duplicate = evaluate_ingestion_controls("same content", config, now=now + timedelta(minutes=5))
+
+            self.assertIsNone(first)
+            self.assertEqual(duplicate, "Duplicate content within deduplication window")
 
 
 if __name__ == "__main__":
