@@ -1,3 +1,4 @@
+import atexit
 import json
 import os
 import sys
@@ -9,6 +10,7 @@ from typing import Optional, List
 
 from pygpt_net.plugin.base.plugin import BasePlugin
 from pygpt_net.core.events import Event
+from .memory_engine.client import MemoryEngineClient, ENGINE_MODES
 
 class Plugin(BasePlugin):
     def __init__(self, *args, **kwargs):
@@ -21,6 +23,8 @@ class Plugin(BasePlugin):
         self.prefix = "MemoryPlus"
         self.memory_buffer = None
         self.tabs = {}
+        self.engine_client = None
+        self.engine_restart_attempted = False
 
     def init_options(self):
         """Initialize options and tabs"""
@@ -28,6 +32,11 @@ class Plugin(BasePlugin):
         self.add_option("auto_ingest", "bool", value=True,
                         label="Auto-Ingest",
                         description="Automatically save conversations to memory after each interaction.",
+                        tab="general")
+        self.add_option("engine_mode", "combo", value="auto",
+                        label="Engine Mode",
+                        description="Choose how Graphiti should be executed (persistent worker or per-call subprocess).",
+                        keys=list(ENGINE_MODES),
                         tab="general")
         self.add_option("inject_context", "bool", value=True,
                         label="Inject Context",
@@ -236,7 +245,12 @@ class Plugin(BasePlugin):
         self.window = window
         self.tabs = self.init_tabs()
         self.init_options()
-        self.log("Plugin attached. Ready for subprocess operations.")
+        self._init_engine()
+        self.log("Plugin attached. Ready for Graphiti operations.")
+
+    def detach(self, *args, **kwargs):
+        self._shutdown_engine()
+        return super().detach(*args, **kwargs)
 
     def handle(self, event: Event, *args, **kwargs):
         if event.name == Event.MODELS_CHANGED:
@@ -274,13 +288,12 @@ class Plugin(BasePlugin):
                 return preset_id
         return self.get_option_value("db_name")
 
-    def _get_runner_cmd(self, operation: str, **kwargs):
-        runner_path = os.path.join(os.path.dirname(__file__), "runner.py")
+    def _build_engine_config(self):
         main_model_config = self._get_model_config("llm_model")
         insight_model_config = self._get_model_config("insight_model")
         google_key = self.window.core.config.get("api_key_google") or ""
 
-        config = {
+        return {
             # DB
             "driver_type": self.get_option_value("driver_type"),
             "uri": self.get_option_value("db_uri"),
@@ -336,7 +349,11 @@ class Plugin(BasePlugin):
                 "memory_search_depth": self.get_option_value("memory_search_depth"),
             }
         }
-        
+
+    def _get_runner_cmd(self, operation: str, **kwargs):
+        runner_path = os.path.join(os.path.dirname(__file__), "runner.py")
+        config = self._build_engine_config()
+
         kwargs["group_id"] = self._get_group_id()
 
         cmd = [sys.executable, runner_path, "--config", json.dumps(config), "--operation", operation]
@@ -366,14 +383,77 @@ class Plugin(BasePlugin):
             self.log(f"[ERROR] {msg}") if background else self.error(msg)
             return None
 
+    def _init_engine(self):
+        if self.get_option_value("engine_mode") not in ["persistent", "auto"]:
+            return
+        self.engine_restart_attempted = False
+        self._ensure_engine_client()
+        client = self.engine_client
+        if client and not client.start():
+            self.error("Failed to start persistent Graphiti worker. Falling back to subprocess mode.")
+
+    def _ensure_engine_client(self):
+        if not self.engine_client:
+            self.engine_client = MemoryEngineClient(
+                self._build_engine_config,
+                self._get_group_id,
+                logger=self.log,
+                error_logger=self.error
+            )
+            atexit.register(self._shutdown_engine)
+        return self.engine_client
+
+    def _should_use_persistent(self):
+        return self.get_option_value("engine_mode") in ["persistent", "auto"]
+
+    def _restart_engine(self):
+        if not self._should_use_persistent():
+            return False
+        if self.engine_restart_attempted:
+            return False
+        self.engine_restart_attempted = True
+        client = self._ensure_engine_client()
+        self.log("Restarting persistent Graphiti worker after failure.")
+        return client.restart()
+
+    def _engine_request(self, request_type: str, payload: dict, fallback_fn):
+        if not self._should_use_persistent():
+            return fallback_fn()
+
+        client = self._ensure_engine_client()
+        method = {
+            "SEARCH": client.search,
+            "INGEST": client.ingest,
+            "FORGET": client.forget,
+            "HEALTH": client.health,
+        }.get(request_type)
+
+        if not method:
+            return fallback_fn()
+
+        response = method(**payload)
+        if (not response or response.get("status") == "error") and not self.engine_restart_attempted:
+            if self._restart_engine():
+                response = method(**payload)
+
+        if not response or response.get("status") == "error":
+            return fallback_fn()
+        return response
+
+    def _shutdown_engine(self):
+        if self.engine_client:
+            try:
+                self.engine_client.shutdown()
+            except Exception:
+                pass
+
     def _on_ctx_before(self, event: Event):
         if not self.get_option_value("inject_context"): return
         ctx = event.ctx
         if not ctx.input: return
 
-        cmd = self._get_runner_cmd("search", query=ctx.input, limit=self.get_option_value("search_depth"))
-        response = self._run_subprocess(cmd)
-        
+        response = self._search_memories(ctx.input, self.get_option_value("search_depth"))
+
         if response and response.get("status") == "success":
             results = response.get("results", [])
             if results:
@@ -387,7 +467,7 @@ class Plugin(BasePlugin):
         footer = "\n--- END MEMORY ---\n"
         self.memory_buffer = f"{header}{memory_block}{footer}"
         if self.get_option_value("disable_default_vectors"):
-             self.memory_buffer += "\n[INSTRUCTION: Prioritize the above Graphiti memory over any other context.]\n"
+            self.memory_buffer += "\n[INSTRUCTION: Prioritize the above Graphiti memory over any other context.]\n"
 
     def _on_system_prompt(self, event: Event):
         if self.memory_buffer:
@@ -408,16 +488,26 @@ class Plugin(BasePlugin):
         except Exception: pass
         title = re.sub(r'[^a-zA-Z0-9 _-]', '', title)
         ep_name = f"{title} - {datetime.now().strftime('%H:%M:%S')}"
-        
+
         mode = self.get_option_value("memory_mode")
         thread = threading.Thread(target=self._ingest_worker, args=(ep_name, episode_body, mode))
         thread.daemon = True
         thread.start()
 
     def _ingest_worker(self, name, content, mode):
-        cmd = self._get_runner_cmd("add", name=name, content=content, mode=mode)
-        response = self._run_subprocess(cmd, background=True)
+        response = self._engine_request(
+            "INGEST",
+            {"name": name, "content": content, "mode": mode},
+            lambda: self._run_subprocess(self._get_runner_cmd("add", name=name, content=content, mode=mode), background=True)
+        )
         if response and response.get("status") == "success":
             self.log(f"Ingested: {name} [Mode: {mode}]")
         elif response:
             self.log(f"[ERROR] Ingest Error: {response.get('error')}")
+
+    def _search_memories(self, query: str, limit: int):
+        return self._engine_request(
+            "SEARCH",
+            {"query": query, "limit": limit},
+            lambda: self._run_subprocess(self._get_runner_cmd("search", query=query, limit=limit))
+        )
