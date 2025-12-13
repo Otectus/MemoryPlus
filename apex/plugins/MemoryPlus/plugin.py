@@ -3,9 +3,11 @@ import os
 import sys
 import subprocess
 import threading
+import queue
+import time
 import re
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 from pygpt_net.plugin.base.plugin import BasePlugin
 from pygpt_net.core.events import Event
@@ -21,6 +23,9 @@ class Plugin(BasePlugin):
         self.prefix = "MemoryPlus"
         self.memory_buffer = None
         self.tabs = {}
+        self.ingest_queue: Optional[queue.Queue] = None
+        self.ingest_thread: Optional[threading.Thread] = None
+        self.ingest_stop_event: Optional[threading.Event] = None
 
     def init_options(self):
         """Initialize options and tabs"""
@@ -217,6 +222,26 @@ class Plugin(BasePlugin):
                         description="Number of memories to retrieve during search.",
                         min=1, max=100,
                         tab="advanced")
+        self.add_option("ingest_queue_size", "int", value=50,
+                        label="Ingestion Queue Size",
+                        description="Maximum number of pending ingestion items. 0 = unlimited.",
+                        min=0, max=1000,
+                        tab="advanced")
+        self.add_option("ingest_overflow_policy", "combo", value="drop_new",
+                        label="Ingestion Overflow Policy",
+                        description="When the ingestion queue is full: drop new item, drop oldest item, or block until space is free.",
+                        keys=["drop_new", "drop_oldest", "block"],
+                        tab="advanced")
+        self.add_option("ingest_batch_max_items", "int", value=5,
+                        label="Ingestion Batch Size",
+                        description="Maximum number of items to process together from the queue.",
+                        min=1, max=100,
+                        tab="advanced")
+        self.add_option("ingest_batch_max_delay_ms", "int", value=250,
+                        label="Ingestion Batch Delay (ms)",
+                        description="Maximum time to wait for additional items before processing a batch.",
+                        min=0, max=5000,
+                        tab="advanced")
 
 
     def init_tabs(self) -> dict:
@@ -237,6 +262,7 @@ class Plugin(BasePlugin):
         self.tabs = self.init_tabs()
         self.init_options()
         self.log("Plugin attached. Ready for subprocess operations.")
+        self._start_ingest_worker()
 
     def handle(self, event: Event, *args, **kwargs):
         if event.name == Event.MODELS_CHANGED:
@@ -387,7 +413,7 @@ class Plugin(BasePlugin):
         footer = "\n--- END MEMORY ---\n"
         self.memory_buffer = f"{header}{memory_block}{footer}"
         if self.get_option_value("disable_default_vectors"):
-             self.memory_buffer += "\n[INSTRUCTION: Prioritize the above Graphiti memory over any other context.]\n"
+            self.memory_buffer += "\n[INSTRUCTION: Prioritize the above Graphiti memory over any other context.]\n"
 
     def _on_system_prompt(self, event: Event):
         if self.memory_buffer:
@@ -408,13 +434,73 @@ class Plugin(BasePlugin):
         except Exception: pass
         title = re.sub(r'[^a-zA-Z0-9 _-]', '', title)
         ep_name = f"{title} - {datetime.now().strftime('%H:%M:%S')}"
-        
-        mode = self.get_option_value("memory_mode")
-        thread = threading.Thread(target=self._ingest_worker, args=(ep_name, episode_body, mode))
-        thread.daemon = True
-        thread.start()
 
-    def _ingest_worker(self, name, content, mode):
+        mode = self.get_option_value("memory_mode")
+        self._enqueue_ingest_request(ep_name, episode_body, mode)
+
+    def _start_ingest_worker(self):
+        if self.ingest_thread and self.ingest_thread.is_alive():
+            return
+
+        maxsize = self.get_option_value("ingest_queue_size") or 0
+        self.ingest_queue = queue.Queue(maxsize=maxsize)
+        self.ingest_stop_event = threading.Event()
+        self.ingest_thread = threading.Thread(target=self._ingest_loop, daemon=True)
+        self.ingest_thread.start()
+
+    def _enqueue_ingest_request(self, name: str, content: str, mode: str):
+        if not self.ingest_queue:
+            self._start_ingest_worker()
+
+        overflow_policy = self.get_option_value("ingest_overflow_policy")
+        item = (name, content, mode)
+
+        try:
+            block = overflow_policy == "block"
+            timeout = 1 if block else 0
+            self.ingest_queue.put(item, block=block, timeout=timeout)
+        except queue.Full:
+            if overflow_policy == "drop_oldest":
+                try:
+                    dropped = self.ingest_queue.get_nowait()
+                    self.ingest_queue.task_done()
+                    self.log(f"[WARN] Ingest queue full. Dropping oldest item: {dropped[0]}")
+                except queue.Empty:
+                    pass
+                try:
+                    self.ingest_queue.put_nowait(item)
+                except queue.Full:
+                    self.log(f"[WARN] Ingest queue full. Dropping new item: {name}")
+            else:
+                self.log(f"[WARN] Ingest queue full. Dropping new item: {name}")
+
+    def _ingest_loop(self):
+        while self.ingest_stop_event and not self.ingest_stop_event.is_set():
+            try:
+                first_item: Tuple[str, str, str] = self.ingest_queue.get(timeout=0.5)  # type: ignore
+            except queue.Empty:
+                continue
+
+            batch = [first_item]
+            max_items = max(1, int(self.get_option_value("ingest_batch_max_items") or 1))
+            max_delay = max(0, int(self.get_option_value("ingest_batch_max_delay_ms") or 0)) / 1000
+            start = time.monotonic()
+
+            while len(batch) < max_items:
+                remaining = max_delay - (time.monotonic() - start)
+                if remaining <= 0:
+                    break
+                try:
+                    next_item = self.ingest_queue.get(timeout=remaining)
+                    batch.append(next_item)
+                except queue.Empty:
+                    break
+
+            for name, content, mode in batch:
+                self._process_ingest(name, content, mode)
+                self.ingest_queue.task_done()
+
+    def _process_ingest(self, name: str, content: str, mode: str):
         cmd = self._get_runner_cmd("add", name=name, content=content, mode=mode)
         response = self._run_subprocess(cmd, background=True)
         if response and response.get("status") == "success":
