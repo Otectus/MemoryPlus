@@ -264,6 +264,10 @@ class Plugin(BasePlugin):
         self.log("Plugin attached. Ready for subprocess operations.")
         self._start_ingest_worker()
 
+    def detach(self, *args, **kwargs):
+        self._stop_ingest_worker()
+        super(Plugin, self).detach(*args, **kwargs)
+
     def handle(self, event: Event, *args, **kwargs):
         if event.name == Event.MODELS_CHANGED:
             self.refresh_option("llm_model")
@@ -448,6 +452,15 @@ class Plugin(BasePlugin):
         self.ingest_thread = threading.Thread(target=self._ingest_loop, daemon=True)
         self.ingest_thread.start()
 
+    def _stop_ingest_worker(self):
+        if self.ingest_stop_event:
+            self.ingest_stop_event.set()
+        if self.ingest_thread and self.ingest_thread.is_alive():
+            self.ingest_thread.join(timeout=2)
+        self.ingest_thread = None
+        self.ingest_queue = None
+        self.ingest_stop_event = None
+
     def _enqueue_ingest_request(self, name: str, content: str, mode: str):
         if not self.ingest_queue:
             self._start_ingest_worker()
@@ -455,10 +468,18 @@ class Plugin(BasePlugin):
         overflow_policy = self.get_option_value("ingest_overflow_policy")
         item = (name, content, mode)
 
+        if overflow_policy == "block":
+            while self.ingest_stop_event and not self.ingest_stop_event.is_set():
+                try:
+                    self.ingest_queue.put(item, timeout=0.5)
+                    return
+                except queue.Full:
+                    continue
+            self.log(f"[WARN] Ingest worker stopping. Dropping item: {name}")
+            return
+
         try:
-            block = overflow_policy == "block"
-            timeout = 1 if block else 0
-            self.ingest_queue.put(item, block=block, timeout=timeout)
+            self.ingest_queue.put(item, block=False)
         except queue.Full:
             if overflow_policy == "drop_oldest":
                 try:
