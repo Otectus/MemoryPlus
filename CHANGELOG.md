@@ -2,7 +2,7 @@
 
 All notable changes to MemoryPlus will be documented here.
 
-## MemoryPlus v1.1 - 2025-12-14
+## MemoryPlus v1.0 - 2025-12-15
 
 - **Persistent Graphiti Worker**
   - Added a multiprocessing engine client/worker pair that keeps Graphiti alive between requests.
