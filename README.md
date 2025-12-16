@@ -4,7 +4,7 @@
 
 # MemoryPlus: Temporal Memory for ApexGPT 🧠✨
 
-**MemoryPlus is more than a database; it's a temporal reasoning engine for your AI.** It empowers [ApexGPT](https://github.com/Otectus/apex_client) to remember *when* things happened, turning flat conversations into a dynamic, time-aware knowledge graph.
+**MemoryPlus is more than a database; it's a temporal reasoning engine for your AI.** It empowers [ApexGPT](https://github.com/Otectus/apex_client) or [PyGPT](https://github.com/szczyglis-dev/py-gpt) to remember *when* things happened, turning flat conversations into a dynamic, time-aware knowledge graph.
 
 Powered by **Graphiti**, this plugin enables your AI to understand context, recall historical details, and build evolving relationships.
 
