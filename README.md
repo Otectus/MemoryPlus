@@ -2,7 +2,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/release/python-3100/)
 [![version](https://img.shields.io/badge/version-1.0.0-green)](./)
 
-# MemoryPlus Plugin for ApexGPT/PyGPT (Graphiti Backend)
+# MemoryPlus Plugin for ApexGPT (PyGPT)
 
 MemoryPlus is an advanced temporal memory and insight analysis plugin for PyGPT, powered by the Graphiti knowledge graph engine. It enables your AI assistant to develop a deeper, more contextual, and actively analyzed understanding of conversations, user preferences, and evolving topics. By leveraging a graph database, MemoryPlus moves beyond simple vector recall to construct a rich, interconnected web of memories and insights, enhancing the AI's ability to maintain coherent, personalized, and intelligent interactions over extended periods.
 
